@@ -1,23 +1,33 @@
+// server.js
 import express from "express";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
-// ====== CONFIG ======
-const LEADS_OBJECT = "leads";
-const OWNER_ROLE_PROP = "owner_role";
-const PRIMARY_VALUE = "Primary";
-const SECONDARY_VALUE = "Secondary";
-const REAL_ESTATE_ID_PROP = "real_estate_record_id";
-// ====================
+// ====== CONFIG (override any of these via Render env vars if you want) ======
+const LEADS_OBJECT = process.env.LEADS_OBJECT || "leads";
+
+// IMPORTANT: these must be the *internal names* of your HubSpot properties
+const OWNER_ROLE_PROP = process.env.OWNER_ROLE_PROP || "owner_role";
+const REAL_ESTATE_ID_PROP =
+  process.env.REAL_ESTATE_ID_PROP || "real_estate_record_id";
+
+const PRIMARY_VALUE = process.env.PRIMARY_VALUE || "Primary";
+const SECONDARY_VALUE = process.env.SECONDARY_VALUE || "Secondary";
+
+// optional delay (ms) to allow your HubSpot workflow to finish writing real_estate_record_id
+const PROCESSING_DELAY_MS = Number(process.env.PROCESSING_DELAY_MS || "2000");
+// ==========================================================================
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
 if (!HUBSPOT_TOKEN) {
-  throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN in .env");
+  throw new Error("Missing HUBSPOT_PRIVATE_APP_TOKEN (set in Render env vars)");
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function hsFetch(path, options = {}) {
   const res = await fetch(`https://api.hubapi.com${path}`, {
@@ -38,9 +48,10 @@ async function hsFetch(path, options = {}) {
 }
 
 async function getLead(leadId) {
+  const props = [REAL_ESTATE_ID_PROP, OWNER_ROLE_PROP].join(",");
   return hsFetch(
     `/crm/v3/objects/${LEADS_OBJECT}/${leadId}?properties=${encodeURIComponent(
-      [REAL_ESTATE_ID_PROP, OWNER_ROLE_PROP].join(",")
+      props
     )}`
   );
 }
@@ -90,49 +101,99 @@ async function getAllSiblingLeads(realEstateId) {
   return all;
 }
 
+function norm(v) {
+  return String(v ?? "").trim().toLowerCase();
+}
+
+app.get("/", (req, res) => {
+  res.status(200).send("OK");
+});
+
+/**
+ * HubSpot Webhook target URL MUST be:
+ *   https://<your-render-domain>/hubspot/webhook
+ */
 app.post("/hubspot/webhook", async (req, res) => {
+  // Respond fast so HubSpot doesn't retry
   res.sendStatus(200);
 
   try {
     const events = Array.isArray(req.body) ? req.body : [];
 
-    const primaryEvents = events.filter(
-      (e) =>
-        (e.subscriptionType || "").includes("propertyChange") &&
-        e.propertyName === OWNER_ROLE_PROP &&
-        e.propertyValue === PRIMARY_VALUE
+    // Log every hit so you can confirm HubSpot is reaching Render
+    console.log(
+      `[WEBHOOK] received ${events.length} events`,
+      JSON.stringify(events.slice(0, 3))
     );
+
+    // Find only Owner Role => Primary changes
+    const primaryEvents = events.filter((e) => {
+      const sub = String(e.subscriptionType || "");
+      const isPropChange =
+        sub.includes("propertyChange") || sub.includes("object.propertyChange");
+
+      return (
+        isPropChange &&
+        String(e.propertyName || "") === OWNER_ROLE_PROP &&
+        norm(e.propertyValue) === norm(PRIMARY_VALUE)
+      );
+    });
+
+    if (!primaryEvents.length) {
+      console.log("[WEBHOOK] no matching Primary owner_role events found");
+      return;
+    }
+
+    // Optional delay so your HubSpot workflow can finish writing the real estate id
+    if (PROCESSING_DELAY_MS > 0) await sleep(PROCESSING_DELAY_MS);
 
     for (const e of primaryEvents) {
       const leadId = e.objectId;
+      console.log(`[PROCESS] Primary set on lead ${leadId}`);
 
+      // Pull latest values from HubSpot (don’t trust webhook payload alone)
       const lead = await getLead(leadId);
       const realEstateId = lead?.properties?.[REAL_ESTATE_ID_PROP];
 
-      if (!realEstateId) continue;
+      console.log(
+        `[PROCESS] lead ${leadId} ${REAL_ESTATE_ID_PROP}=${realEstateId}`
+      );
+
+      if (!realEstateId) {
+        console.log(
+          `[SKIP] lead ${leadId} missing ${REAL_ESTATE_ID_PROP} (workflow may not have run yet)`
+        );
+        continue;
+      }
 
       const siblings = await getAllSiblingLeads(realEstateId);
+      console.log(
+        `[SIBLINGS] realEstateId ${realEstateId} => ${siblings.length} lead(s)`
+      );
+
+      let updated = 0;
 
       for (const sib of siblings) {
         if (String(sib.id) === String(leadId)) continue;
 
         const current = sib?.properties?.[OWNER_ROLE_PROP];
-        if (current === SECONDARY_VALUE) continue;
+
+        // If already Secondary, skip
+        if (norm(current) === norm(SECONDARY_VALUE)) continue;
 
         await updateLead(sib.id, { [OWNER_ROLE_PROP]: SECONDARY_VALUE });
-        console.log(`Set lead ${sib.id} to Secondary`);
+        updated += 1;
+        console.log(`[UPDATE] Set lead ${sib.id} => ${SECONDARY_VALUE}`);
       }
 
-      console.log(`Primary lead confirmed: ${leadId}`);
+      console.log(
+        `[DONE] primary lead ${leadId} confirmed. updated ${updated} sibling lead(s) to Secondary`
+      );
     }
   } catch (err) {
-    console.error("Webhook error:", err.message);
+    console.error("[WEBHOOK ERROR]", err?.message || err);
   }
 });
 
-app.get("/", (req, res) => res.send("OK"));
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`Listening on http://localhost:${PORT}`)
-);
+app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
