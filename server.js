@@ -1,6 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
-import { runWorkflows } from "./Workflows";
+import { runWorkflows } from "./Workflows/index.js";
+
 
 dotenv.config();
 
