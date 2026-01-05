@@ -1,14 +1,14 @@
 import { primarySecondaryOwnerRole } from "./primarySecondaryOwnerRole.js";
+import { taskMirrorToAssociatedContacts } from "./taskMirrorToAssociatedContacts.js";
 
 const workflows = [
   primarySecondaryOwnerRole,
-  // add more workflows here
+  taskMirrorToAssociatedContacts,
 ];
 
 export async function runWorkflows(events) {
   if (!events?.length) return;
 
-  // Run each workflow; one failing won't break the others
   await Promise.all(
     workflows.map(async (wf) => {
       try {
